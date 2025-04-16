@@ -1,100 +1,125 @@
 import os
 import time
 import pandas as pd
+import requests
+import openpyxl
+from openpyxl.styles import PatternFill
+from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from webdriver_manager.chrome import ChromeDriverManager
 
-#---Config---
-SEARCH_QUERY = "Yamaha MT-07"
-EXCEL_FILE = "yamaha_mt07_ads.xlsx"
+# --- Setup ---
+search_term = input("Enter the bike model to search (e.g. Yamaha MT-07): ").strip()
+search_slug = search_term.lower().replace(" ", "-")
 
-# Chrome Setup
+SEEN_ADS_FILE = f"seen_{search_slug}.txt"
+EXCEL_FILE = f"{search_slug}_ads.xlsx"
+
+# Headless Chrome setup
 chrome_options = Options()
-# chrome_options.add_argument("--headless")  # DISABLE headless to see browser
+chrome_options.add_argument("--headless")
 chrome_options.add_argument("--start-maximized")
-service = Service(ChromeDriverManager().install())
-driver = webdriver.Chrome(service=service, options=chrome_options)
+driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
 
-# Open OLX
-driver.get("https://www.olx.ro")
-time.sleep(3)
-
-# Search for the query
-search_box = driver.find_element(By.CSS_SELECTOR, 'input[placeholder*="Ce anume cauți?"]')
-search_box.send_keys(SEARCH_QUERY)
-search_box.send_keys(Keys.RETURN)
-time.sleep(4)
-
-# Scroll slowly to ensure all listings are loaded
-for _ in range(5):
-    driver.execute_script("window.scrollBy(0, 1000);")
-    time.sleep(1.5)
-
-# Extract Listings
-ads = driver.find_elements(By.CSS_SELECTOR, 'div[data-testid="listing-grid"] > div')
-new_ads = []
-
-print(f"Found {len(ads)} ads...")
-
-for i, ad in enumerate(ads):
+# --- Helper: Ad still active ---
+def is_ad_still_active(url):
     try:
+        response = requests.get(url, timeout=10)
+        if response.status_code != 200 or "Anuntul pe care il cauti nu mai exista" in response.text:
+            return False
+        return True
+    except:
+        return False
 
-        try:
-            link_elem = ad.find_element(By.CSS_SELECTOR, 'a')
-            url_suffix = link_elem.get_attribute("href")
-            url = "https://www.olx.ro" + url_suffix if url_suffix.startswith("/d/") else url_suffix
-        except Exception as e:
-            print(f"Skipping ad {i+1}: Link element not found")
-            continue
+# --- Load existing ads ---
+if os.path.exists(SEEN_ADS_FILE):
+    with open(SEEN_ADS_FILE, "r") as f:
+        seen_urls = set(f.read().splitlines())
+else:
+    seen_urls = set()
 
-        img_elem = link_elem.find_element(By.TAG_NAME, "img")
-        title = img_elem.get_attribute("alt").strip()
-
-        # Price (fallback: find <p> with 'lei' or €)
-        try:
-            price_elem = ad.find_element(By.XPATH, './/p[contains(text(),"€") or contains(text(),"lei")]')
-            price = price_elem.text.strip()
-        except:
-            price = "N/A"
-
-        # Location
-        try:
-            location_elem = ad.find_element(By.CSS_SELECTOR, 'p[data-testid="location-date"]')
-            location = location_elem.text.split(" - ")[0].strip()
-        except:
-            location = "N/A"
-
-        new_ads.append({
-            "Title": title,
-            "URL": url,
-            "Price": price,
-            "Location": location
-        })
-
-    except Exception as e:
-        print(f"Skipping ad {i+1}: {str(e)}")
-
-
+# --- Load previous prices if available ---
 if os.path.exists(EXCEL_FILE):
     df_existing = pd.read_excel(EXCEL_FILE)
-    existing_urls = set(df_existing["URL"])
+    old_prices = dict(zip(df_existing["URL"], df_existing["Price"]))
 else:
-    df_existing = pd.DataFrame()
-    existing_urls = set()
+    df_existing = pd.DataFrame(columns=["Title", "URL", "Price", "Location"])
+    old_prices = {}
 
+# --- Scrap Multiple Pages ---
+all_ads = []
+for page in range(1, 6):  # Scrape first 5 pages
+    search_url = f"https://www.olx.ro/d/oferte/q-{search_slug}/?page={page}"
+    print(f"Scraping page {page}: {search_url}")
+    driver.get(search_url)
+    time.sleep(3)
 
-fresh_ads = [ad for ad in new_ads if ad["URL"] not in existing_urls]
+    ads = driver.find_elements(By.CSS_SELECTOR, 'div[data-testid="listing-grid"] > div')
+    if not ads:
+        break
 
-if fresh_ads:
-    print(f"{len(fresh_ads)} new listings found:")
-    df_new = pd.DataFrame(fresh_ads)
-    df_combined = pd.concat([df_existing, df_new], ignore_index=True)
-    df_combined.drop_duplicates(subset="URL", inplace=True)
-    df_combined.to_excel(EXCEL_FILE, index=False)
-    print(f" Updated Excel: {EXCEL_FILE}")
+    for ad in ads:
+        try:
+            link_element = ad.find_element(By.CSS_SELECTOR, 'a.css-1tqlkj0')
+            url = link_element.get_attribute("href").strip()
+
+            title = link_element.get_attribute("title") or link_element.text.strip() or "No title"
+            if url in seen_urls:
+                continue
+
+            price_elem = ad.find_element(By.CSS_SELECTOR, '[data-testid="ad-price"]')
+            price = price_elem.text.strip()
+
+            location_elem = ad.find_element(By.CSS_SELECTOR, '[data-testid="location-date"]')
+            location = location_elem.text.split(" - ")[0].strip()
+
+            old_price = old_prices.get(url)
+            all_ads.append({
+                "Title": title,
+                "URL": url,
+                "Price": price,
+                "Location": location,
+                "Previous Price": old_price if old_price and old_price != price else None
+            })
+        except Exception:
+            continue
+
+driver.quit()
+
+# --- Clean removed ads from Excel ---
+if not df_existing.empty:
+    df_existing = df_existing[df_existing["URL"].apply(is_ad_still_active)]
+    seen_urls = set(df_existing["URL"])
+
+# --- Add new ads ---
+new_ads = [ad for ad in all_ads if ad["URL"] not in seen_urls]
+if new_ads:
+    print(f"Found {len(new_ads)} new ads:")
+    for ad in new_ads:
+        print(f"{ad['Title']} - {ad['Price']} - {ad['Location']}\n{ad['URL']}\n")
+
+    df_new = pd.DataFrame(new_ads)
+    df_result = pd.concat([df_existing, df_new], ignore_index=True)
+
+    # Save to Excel with formatting
+    with pd.ExcelWriter(EXCEL_FILE, engine='openpyxl') as writer:
+        df_result.to_excel(writer, index=False, sheet_name='Ads')
+        workbook = writer.book
+        sheet = writer.sheets['Ads']
+
+        green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+
+        for idx, row in df_result.iterrows():
+            if pd.notna(row.get("Previous Price")):
+                for col in range(1, len(df_result.columns) + 1):
+                    sheet.cell(row=idx + 2, column=col).fill = green_fill
+
+    # Save new seen URLs
+    with open(SEEN_ADS_FILE, "w") as f:
+        for url in df_result["URL"]:
+            f.write(url + "\n")
 else:
-    print("No new listings found.")
+    print("No new ads found.")
